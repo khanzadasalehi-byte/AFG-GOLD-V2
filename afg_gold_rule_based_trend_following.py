@@ -29,6 +29,54 @@ if not API_KEY:
     st.error("API Key در Streamlit Secrets پیدا نشد. در Settings > Secrets این مقدار را ذخیره کن: TWELVE_DATA_API_KEY = \"YOUR_KEY\"")
     st.stop()
 
+
+# Telegram notifications are optional until both Streamlit secrets are configured.
+try:
+    TELEGRAM_BOT_TOKEN = st.secrets.get("TELEGRAM_BOT_TOKEN", "")
+    TELEGRAM_CHAT_ID = st.secrets.get("TELEGRAM_CHAT_ID", "")
+except Exception:
+    TELEGRAM_BOT_TOKEN = ""
+    TELEGRAM_CHAT_ID = ""
+
+def send_telegram_signal(result):
+    """Send one signal message; return (success, explanation)."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False, "تنظیمات تلگرام در Secrets وارد نشده است."
+    side = result["side"]
+    if side not in ("BUY", "SELL") or result["score"] <= 40:
+        return False, "سیگنال معتبر برای ارسال وجود ندارد."
+    market = (
+        f"📍 {side} MARKET\nEntry: {price(result['price'])}\n"
+        f"SL: {price(result['sl'])}\n"
+        f"TP1: {price(result['tps'][0])}\n"
+        f"TP2: {price(result['tps'][1])}\n"
+        f"TP3: {price(result['tps'][2])}"
+    )
+    limit_side = "BUY LIMIT" if side == "BUY" else "SELL LIMIT"
+    limit = (
+        f"\n\n🎯 {limit_side}\nEntry: {price(result['limit_entry'])}\n"
+        f"SL: {price(result['limit_sl'])}\n"
+        f"TP1: {price(result['limit_tps'][0])}\n"
+        f"TP2: {price(result['limit_tps'][1])}\n"
+        f"TP3: {price(result['limit_tps'][2])}"
+    )
+    stamp = result["candle_time"].strftime("%Y-%m-%d %H:%M UTC")
+    message = (
+        f"🚨 AFG GOLD + BTC PRO SCANNER\n"
+        f"Market: {result['symbol']}\nSignal: {side} | Grade {result['grade']} | Score {result['score']}/100\n"
+        f"Price: {price(result['price'])}\n"
+        f"RSI: {result['rsi']:.1f} | ADX: {result['adx']:.1f}\n"
+        f"1H: {result['trend1h']} | 4H: {result['trend4h']}\n"
+        f"Candle: {stamp}\n\n{market}{limit}\n\n"
+        "یادآوری: این سیگنال توصیه مالی نیست؛ Limit فقط قیمت پیشنهادی است و سفارش خودکار اجرا نمی‌شود."
+    )
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    response = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message}, timeout=15)
+    payload = response.json()
+    if response.ok and payload.get("ok"):
+        return True, "اعلان تلگرام فرستاده شد."
+    return False, payload.get("description", f"Telegram HTTP {response.status_code}")
+
 AUTO_REFRESH_MS = 5 * 60 * 1000
 st_autorefresh(interval=AUTO_REFRESH_MS, key="market_scanner_refresh")
 
@@ -208,6 +256,34 @@ with tab_scan:
             scan_results.append(analyze(sym))
         except Exception as e:
             st.warning(f"{sym}: {e}")
+    # Notify once per symbol, direction and 15m candle. Streamlit reruns won't spam duplicates.
+    if "telegram_sent_signal_keys" not in st.session_state:
+        st.session_state.telegram_sent_signal_keys = set()
+    sent_count = 0
+    telegram_errors = []
+    for result in scan_results:
+        if result["side"] not in ("BUY", "SELL") or result["score"] <= 40:
+            continue
+        signal_key = (result["symbol"], result["side"], result["candle_time"].isoformat())
+        if signal_key in st.session_state.telegram_sent_signal_keys:
+            continue
+        ok, detail = send_telegram_signal(result)
+        if ok:
+            st.session_state.telegram_sent_signal_keys.add(signal_key)
+            sent_count += 1
+        elif TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+            telegram_errors.append(f"{result['symbol']}: {detail}")
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        if sent_count:
+            st.success(f"{sent_count} اعلان جدید به تلگرام ارسال شد.")
+        elif telegram_errors:
+            for err in telegram_errors:
+                st.warning(f"خطای ارسال تلگرام — {err}")
+        else:
+            st.caption("تلگرام فعال است؛ در این اسکن سیگنال تازه‌ای برای ارسال نبود.")
+    else:
+        st.warning("اعلان تلگرام هنوز فعال نیست؛ TELEGRAM_BOT_TOKEN و TELEGRAM_CHAT_ID را در Streamlit Secrets اضافه کن.")
+
     if scan_results:
         st.dataframe(pd.DataFrame([{"Market":r["symbol"],"Signal":r["side"],"Grade":r["grade"],
                                     "Score":r["score"],"Price":r["price"],
