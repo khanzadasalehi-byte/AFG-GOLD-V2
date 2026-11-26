@@ -154,7 +154,9 @@ def build_signal(m15, h1, h4, min_adx, min_score, use_session):
     score = int(round(max(long_score, short_score))) if side != "WAIT" else 0
     if use_session and not in_session:
         side = "WAIT"
-    if score < min_score or not checks or not all(checks.values()):
+    # Filters contribute to the score; they are not all mandatory.
+    # Signal only when the score is strictly greater than the selected threshold.
+    if score <= min_score or not checks:
         side = "WAIT"
 
     price = float(x.close)
@@ -212,7 +214,7 @@ st.sidebar.markdown("## 🟡 AFG GOLD")
 st.sidebar.caption("MARKET DATA & STRATEGY SETTINGS")
 api_key = st.sidebar.text_input("Twelve Data API Key", type="password", help="کلید API خود را از حساب Twelve Data وارد کنید.")
 st.sidebar.markdown("### STRATEGY SETTINGS")
-min_score = st.sidebar.slider("Minimum signal score", 50, 100, 85, 5)
+min_score = st.sidebar.slider("Minimum signal score", 40, 100, 40, 1)
 min_adx = st.sidebar.slider("Minimum ADX trend strength", 10, 35, 16, 1)
 use_session = st.sidebar.checkbox("London / New York session filter", value=True)
 valid_minutes = st.sidebar.selectbox("Signal validity (minutes)", [15, 30, 45, 60], index=2)
@@ -376,7 +378,7 @@ with st.expander("Show rule-by-rule signal checklist"):
             st.write(("✅ " if passed else "❌ ") + name)
     else:
         st.write("No trade: at least one required trend-following condition is not satisfied.")
-    st.caption("Entry requires aligned 1H and 4H direction, 15M EMA alignment, ADX strength, RSI momentum, candle confirmation, and session filter when enabled.")
+    st.caption("The selected direction is scored from the trend filters. A signal is allowed only when the score is strictly above the selected minimum; 1H/4H trend alignment and the optional session filter remain important context.")
 
 with st.expander("Recent XAU/USD candles"):
     st.line_chart(m15.tail(120)["close"], height=220)
