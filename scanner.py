@@ -1,70 +1,64 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import requests
-from datetime import datetime, timedelta, timezone
+"""
+AFG GOLD standalone scanner for GitHub Actions.
+Uses the same 7-filter Rule-Based Trend Following logic as the Streamlit app.
+Telegram alerts are sent for XAU/USD only. BTC/USDT is scanned for diagnostics only.
+"""
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
-import html
 
-# ============================================================
-# AFG GOLD | RULE-BASED TREND FOLLOWING
-# One-file Streamlit app. Data: Twelve Data (XAU/USD).
-# Signals are decision support, not financial advice.
-# ============================================================
+import numpy as np
+import pandas as pd
+import requests
 
-st.set_page_config(
-    page_title="AFG GOLD | XAUUSD",
-    page_icon="🟡",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+API_URL = "https://api.twelvedata.com/time_series"
+STATE_FILE = Path(".afg_gold_scanner_state.json")
+MIN_SCORE = 40
+MIN_ADX = 16
+USE_SESSION_FILTER = True
+OUTPUT_SIZE = 500
+TIMEOUT = 25
 
-st.markdown("""
-<style>
-:root { color-scheme: dark; }
-.stApp { background: #090611; color: #d8c9f5; }
-[data-testid="stSidebar"] { background: #17141e; border-right: 1px solid #30283b; }
-.block-container { padding-top: 1.2rem; max-width: 1100px; }
-h1,h2,h3,p,label { font-family: Georgia, 'Times New Roman', serif; }
-div[data-testid="stMetric"] { background:#100b1b; border:1px solid #30233d; padding:12px; border-radius:12px; }
-.stButton > button { width:100%; border-radius:10px; min-height:46px; font-weight:800; }
-div.stButton > button[kind="primary"] { background:#087a43; border:1px solid #29db83; color:white; }
-div.stButton > button[kind="secondary"] { background:#491b28; border:1px solid #d74b65; color:white; }
-.small-muted { color:#8d7da8; letter-spacing:2px; font-size:11px; }
-</style>
-""", unsafe_allow_html=True)
-
-# ----------------------- indicators -------------------------
 
 def ema(series, n):
     return series.ewm(span=n, adjust=False).mean()
 
-def rsi(series, n=14):
-    delta = series.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1/n, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1/n, adjust=False).mean()
-    rs = gain / loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
 
 def atr(df, n=14):
     prev_close = df["close"].shift(1)
-    tr = pd.concat([
-        df["high"] - df["low"],
-        (df["high"] - prev_close).abs(),
-        (df["low"] - prev_close).abs()
-    ], axis=1).max(axis=1)
-    return tr.ewm(alpha=1/n, adjust=False).mean()
+    tr = pd.concat(
+        [
+            df["high"] - df["low"],
+            (df["high"] - prev_close).abs(),
+            (df["low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return tr.ewm(alpha=1 / n, adjust=False).mean()
+
+
+def rsi(series, n=14):
+    delta = series.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
+    rs = gain / loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
 
 def adx(df, n=14):
     up = df["high"].diff()
     down = -df["low"].diff()
     plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=df.index)
     minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=df.index)
-    a = atr(df, n).replace(0, np.nan)
-    plus_di = 100 * plus_dm.ewm(alpha=1/n, adjust=False).mean() / a
-    minus_di = 100 * minus_dm.ewm(alpha=1/n, adjust=False).mean() / a
+    average_range = atr(df, n).replace(0, np.nan)
+    plus_di = 100 * plus_dm.ewm(alpha=1 / n, adjust=False).mean() / average_range
+    minus_di = 100 * minus_dm.ewm(alpha=1 / n, adjust=False).mean() / average_range
     dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-    return dx.ewm(alpha=1/n, adjust=False).mean()
+    return dx.ewm(alpha=1 / n, adjust=False).mean()
+
 
 def add_indicators(df):
     df = df.copy()
@@ -75,24 +69,22 @@ def add_indicators(df):
     df["adx"] = adx(df)
     return df.dropna().copy()
 
-# ----------------------- market data ------------------------
 
-@st.cache_data(ttl=60, show_spinner=False)
-def get_candles(api_key, interval, outputsize=500):
-    url = "https://api.twelvedata.com/time_series"
+def fetch_candles(api_key, symbol, interval):
     params = {
-        "symbol": "XAU/USD",
+        "symbol": symbol,
         "interval": interval,
-        "outputsize": outputsize,
+        "outputsize": OUTPUT_SIZE,
         "apikey": api_key,
         "format": "JSON",
         "timezone": "UTC",
     }
-    response = requests.get(url, params=params, timeout=25)
+    response = requests.get(API_URL, params=params, timeout=TIMEOUT)
     response.raise_for_status()
     payload = response.json()
     if "values" not in payload:
-        raise ValueError(payload.get("message", payload.get("code", "No candle data returned")))
+        message = payload.get("message") or payload.get("code") or str(payload)
+        raise RuntimeError(f"Twelve Data {symbol} {interval}: {message}")
     df = pd.DataFrame(payload["values"])
     for col in ("open", "high", "low", "close"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -100,10 +92,8 @@ def get_candles(api_key, interval, outputsize=500):
     df = df.dropna(subset=["datetime", "open", "high", "low", "close"])
     return df.sort_values("datetime").set_index("datetime")
 
-# ----------------------- strategy ----------------------------
 
 def market_session(now_utc):
-    # London / New York local clocks, including daylight-saving changes.
     london = now_utc.astimezone(ZoneInfo("Europe/London"))
     new_york = now_utc.astimezone(ZoneInfo("America/New_York"))
     london_open = 8 <= london.hour < 17
@@ -116,386 +106,218 @@ def market_session(now_utc):
         return "NEW YORK", True
     return "OFF SESSION", False
 
-def build_signal(m15, h1, h4, min_adx, min_score, use_session):
-    a = add_indicators(m15)
-    b = add_indicators(h1)
-    c = add_indicators(h4)
+
+def build_signal(m15, h1, h4):
+    a, b, c = add_indicators(m15), add_indicators(h1), add_indicators(h4)
     if min(len(a), len(b), len(c)) < 5:
         raise ValueError("Not enough historical candles for indicator calculations.")
 
-    x, p = a.iloc[-1], a.iloc[-2]
+    x, previous = a.iloc[-1], a.iloc[-2]
     one, four = b.iloc[-1], c.iloc[-1]
-    now = datetime.now(timezone.utc)
-    session, in_session = market_session(now)
+    session, in_session = market_session(datetime.now(timezone.utc))
 
     long_checks = {
         "1H bullish trend": one.ema20 > one.ema50 and one.close > one.ema200,
         "4H bullish trend": four.ema20 > four.ema50,
         "15M EMA alignment": x.ema20 > x.ema50,
-        "ADX trend strength": x.adx >= min_adx,
+        "ADX trend strength": x.adx >= MIN_ADX,
         "RSI bullish momentum": 50 <= x.rsi <= 72,
-        "Bullish candle confirmation": x.close > x.open and x.close > p.high,
+        "Bullish candle confirmation": x.close > x.open and x.close > previous.high,
         "Price above 15M EMA20": x.close > x.ema20,
     }
     short_checks = {
         "1H bearish trend": one.ema20 < one.ema50 and one.close < one.ema200,
         "4H bearish trend": four.ema20 < four.ema50,
         "15M EMA alignment": x.ema20 < x.ema50,
-        "ADX trend strength": x.adx >= min_adx,
+        "ADX trend strength": x.adx >= MIN_ADX,
         "RSI bearish momentum": 28 <= x.rsi <= 50,
-        "Bearish candle confirmation": x.close < x.open and x.close < p.low,
+        "Bearish candle confirmation": x.close < x.open and x.close < previous.low,
         "Price below 15M EMA20": x.close < x.ema20,
     }
 
-    long_score = sum(bool(v) for v in long_checks.values()) / len(long_checks) * 100
-    short_score = sum(bool(v) for v in short_checks.values()) / len(short_checks) * 100
+    long_score = sum(bool(v) for v in long_checks.values()) / 7 * 100
+    short_score = sum(bool(v) for v in short_checks.values()) / 7 * 100
     side = "BUY" if long_score > short_score else "SELL" if short_score > long_score else "WAIT"
     checks = long_checks if side == "BUY" else short_checks if side == "SELL" else {}
     score = int(round(max(long_score, short_score))) if side != "WAIT" else 0
-    if use_session and not in_session:
+
+    if USE_SESSION_FILTER and not in_session:
         side = "WAIT"
-    # Filters contribute to the score; they are not all mandatory.
-    # Signal only when the score is strictly greater than the selected threshold.
-    if score <= min_score or not checks:
+    if score <= MIN_SCORE or not checks:
         side = "WAIT"
 
     price = float(x.close)
     volatility = float(x.atr)
     if not np.isfinite(volatility) or volatility <= 0:
-        raise ValueError("ATR could not be calculated from the returned candles.")
+        raise ValueError("ATR could not be calculated.")
 
     if side == "BUY":
         swing = float(a["low"].tail(8).min())
-        sl = min(swing, price - 1.35 * volatility)
-        risk = max(price - sl, 0.65 * volatility)
+        risk = max(price - min(swing, price - 1.35 * volatility), 0.65 * volatility)
         sl = price - risk
-        entry_low, entry_high = price - 0.12 * volatility, price + 0.12 * volatility
         direction = 1
     elif side == "SELL":
         swing = float(a["high"].tail(8).max())
-        sl = max(swing, price + 1.35 * volatility)
-        risk = max(sl - price, 0.65 * volatility)
+        risk = max(max(swing, price + 1.35 * volatility) - price, 0.65 * volatility)
         sl = price + risk
-        entry_low, entry_high = price - 0.12 * volatility, price + 0.12 * volatility
         direction = -1
     else:
-        sl = risk = entry_low = entry_high = np.nan
-        direction = 0
+        return {
+            "side": "WAIT", "score": score, "session": session,
+            "price": price, "candle_time": a.index[-1].isoformat(),
+        }
 
-    if side != "WAIT":
-        tps = [price + direction * risk * rr for rr in (1.42, 2.24, 3.0)]
-        rr_text = f"1:{2.24:.2f}"
-        invalidation = sl
-        grade = "A" if score >= 90 else "B" if score >= 80 else "C"
-        risk_label = "LOW RISK" if score >= 90 else "MODERATE RISK" if score >= 80 else "HIGHER RISK"
-        reason = "Trend conditions aligned" if score >= 85 else "Trend setup confirmed"
-    else:
-        tps = [np.nan, np.nan, np.nan]
-        rr_text, invalidation, grade, risk_label = "—", np.nan, "—", "NO TRADE"
-        reason = "WAIT FOR A VALID TREND SETUP"
+    tps = [price + direction * risk * rr for rr in (1.42, 2.24, 3.0)]
+    grade = "A+" if score >= 95 else "A" if score >= 85 else "B" if score >= 70 else "C"
+
+    # A limit idea is included only when EMA20 is a nearby pullback level.
+    ema20 = float(x.ema20)
+    distance = abs(price - ema20)
+    limit_entry = None
+    if distance <= 0.50 * volatility and (
+        (side == "BUY" and ema20 < price) or (side == "SELL" and ema20 > price)
+    ):
+        limit_entry = ema20
 
     return {
-        "side": side, "score": score, "grade": grade, "risk_label": risk_label,
-        "session": session, "price": price, "entry_low": entry_low,
-        "entry_high": entry_high, "sl": sl, "tps": tps, "rr": rr_text,
-        "invalidation": invalidation, "reason": reason, "checks": checks,
-        "rsi": float(x.rsi), "adx": float(x.adx), "atr": volatility,
-        "trend_1h": "BULLISH" if one.ema20 > one.ema50 else "BEARISH",
-        "trend_4h": "BULLISH" if four.ema20 > four.ema50 else "BEARISH",
-        "ema20_15m": float(x.ema20),
-        "candle_time": a.index[-1],
+        "side": side,
+        "score": score,
+        "grade": grade,
+        "session": session,
+        "price": price,
+        "sl": sl,
+        "tps": tps,
+        "rr": "1:2.24",
+        "limit_entry": limit_entry,
+        "candle_time": a.index[-1].isoformat(),
+        "rsi": float(x.rsi),
+        "adx": float(x.adx),
     }
 
-def fmt(v):
-    return "—" if pd.isna(v) else f"{v:,.2f}"
 
-# ----------------------- secure settings --------------------
+def fmt(value):
+    return f"{value:,.2f}"
 
-# Prefer Streamlit Cloud Secrets so credentials survive browser refreshes.
-def secret_value(name):
-    try:
-        return str(st.secrets.get(name, "")).strip()
-    except Exception:
-        return ""
 
-api_key_secret = secret_value("TWELVE_DATA_API_KEY")
-telegram_token = secret_value("TELEGRAM_BOT_TOKEN")
-telegram_chat_id = secret_value("TELEGRAM_CHAT_ID")
+def build_telegram_message(signal):
+    direction = 1 if signal["side"] == "BUY" else -1
+    lines = [
+        "🇦🇫 AFG GOLD — SIGNAL",
+        "Symbol: XAU/USD",
+        f"Direction: {signal['side']}",
+        "",
+        "MARKET ENTRY",
+        f"Entry: {fmt(signal['price'])}",
+        f"Stop Loss: {fmt(signal['sl'])}",
+        f"TP1: {fmt(signal['tps'][0])}",
+        f"TP2: {fmt(signal['tps'][1])}",
+        f"TP3: {fmt(signal['tps'][2])}",
+    ]
+    if signal["limit_entry"] is not None:
+        limit = signal["limit_entry"]
+        risk = abs(limit - signal["sl"])
+        limit_tps = [limit + direction * risk * rr for rr in (1.42, 2.24, 3.0)]
+        lines += [
+            "",
+            "LIMIT ENTRY IDEA (pullback)",
+            f"Entry: {fmt(limit)}",
+            f"Stop Loss: {fmt(signal['sl'])}",
+            f"TP1: {fmt(limit_tps[0])}",
+            f"TP2: {fmt(limit_tps[1])}",
+            f"TP3: {fmt(limit_tps[2])}",
+        ]
+    else:
+        lines += ["", "LIMIT ENTRY: No valid pullback setup"]
+    lines += [
+        "",
+        f"Score: {signal['score']}/100 | Grade: {signal['grade']}",
+        f"Session: {signal['session']} | R:R (Market): {signal['rr']}",
+        f"RSI: {signal['rsi']:.1f} | ADX: {signal['adx']:.1f}",
+        "Decision support only. Verify price and risk before trading.",
+    ]
+    return "\n".join(lines)
 
-# ----------------------- Telegram alerts --------------------
 
 def send_telegram(message):
-    if not telegram_token or not telegram_chat_id:
-        return False, "Telegram credentials are missing in Streamlit Secrets."
-    url = f"https://api.telegram.org/bot{telegram_token}/sendMessage"
-    try:
-        response = requests.post(
-            url,
-            data={"chat_id": telegram_chat_id, "text": message, "disable_web_page_preview": True},
-            timeout=15,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        if not payload.get("ok"):
-            return False, "Telegram did not accept the message. Check Chat ID and bot access."
-        return True, "Telegram alert sent."
-    except Exception as exc:
-        return False, f"Telegram send failed: {exc}"
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID GitHub secret.")
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    response = requests.post(
+        url,
+        data={"chat_id": chat_id, "text": message, "disable_web_page_preview": True},
+        timeout=20,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not payload.get("ok"):
+        raise RuntimeError(f"Telegram rejected the message: {payload}")
+    return True
 
-def telegram_signal_message(signal, entry_type, entry, sl, tps, note=""):
-    side = signal["side"]
-    label = "MARKET ENTRY" if entry_type == "MARKET" else "LIMIT ENTRY"
-    return (
-        f"🇦🇫 AFG GOLD — {label}\n"
-        f"Symbol: XAU/USD\nDirection: {side}\n"
-        f"Entry: {fmt(entry)}\nStop Loss: {fmt(sl)}\n"
-        f"TP1: {fmt(tps[0])}\nTP2: {fmt(tps[1])}\nTP3: {fmt(tps[2])}\n"
-        f"Score: {signal['score']}/100 | Grade: {signal['grade']}\n"
-        f"Session: {signal['session']} | R:R: {signal['rr']}\n"
-        f"Validity: {signal.get('valid_minutes', 45)} minutes\n"
-        f"{note}\nNot financial advice. Verify price and risk before trading."
+
+def read_state():
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def write_state(state):
+    STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+def scan_symbol(api_key, symbol):
+    m15 = fetch_candles(api_key, symbol, "15min")
+    h1 = fetch_candles(api_key, symbol, "1h")
+    h4 = fetch_candles(api_key, symbol, "4h")
+    return build_signal(m15, h1, h4)
+
+
+def main():
+    api_key = os.getenv("TWELVE_DATA_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("Missing TWELVE_DATA_API_KEY GitHub secret.")
+
+    # Gold is scanned first so BTC diagnostics cannot prevent the gold alert.
+    gold = scan_symbol(api_key, "XAU/USD")
+    print(
+        f"XAU/USD: side={gold['side']} score={gold['score']} "
+        f"grade={gold.get('grade', '-')} candle={gold['candle_time']}"
     )
 
-st.sidebar.markdown("## 🟡 AFG GOLD")
-st.sidebar.caption("MARKET DATA & STRATEGY SETTINGS")
-api_key = api_key_secret or st.sidebar.text_input("Twelve Data API Key", type="password", help="برای ماندگاری، کلید را در Streamlit Cloud → Settings → Secrets ذخیره کن.")
-if api_key_secret:
-    st.sidebar.success("Twelve Data API key loaded from Secrets")
-st.sidebar.markdown("### STRATEGY SETTINGS")
-min_score = st.sidebar.slider("Minimum signal score", 40, 100, 40, 1)
-min_adx = st.sidebar.slider("Minimum ADX trend strength", 10, 35, 16, 1)
-use_session = st.sidebar.checkbox("London / New York session filter", value=True)
-valid_minutes = st.sidebar.selectbox("Signal validity (minutes)", [15, 30, 45, 60], index=2)
-st.sidebar.caption("TP allocation: TP1 = 50%  ·  TP2 = 30%  ·  TP3 = 20%")
-st.sidebar.caption("Risk settings are rule-based. No account balance is requested.")
-refresh = st.sidebar.button("↻ REFRESH MARKET DATA", use_container_width=True)
-if refresh:
-    st.cache_data.clear()
-    st.rerun()
-
-# ----------------------- header -----------------------------
-
-st.markdown("<div style='font-size:30px;font-weight:900;color:#eee2ff'>🟡 AFG GOLD</div>", unsafe_allow_html=True)
-st.markdown("<div class='small-muted'>ORIGINAL RULE-BASED TREND FOLLOWING · XAU/USD</div>", unsafe_allow_html=True)
-st.write("")
-
-if not api_key:
-    st.info("Enter your Twelve Data API Key in the left settings panel to load live market candles and calculate a signal.")
-    st.warning("The signal card below will populate only after real market data is received. No sample price or fabricated signal is used.")
-    st.stop()
-
-try:
-    with st.spinner("Loading XAU/USD candles and calculating trend conditions..."):
-        m15 = get_candles(api_key, "15min", 500)
-        h1 = get_candles(api_key, "1h", 300)
-        h4 = get_candles(api_key, "4h", 300)
-        signal = build_signal(m15, h1, h4, min_adx, min_score, use_session)
-except Exception as exc:
-    st.error(f"Market data error: {html.escape(str(exc))}")
-    st.caption("Check the API key, Twelve Data plan/credits, internet connection, and XAU/USD symbol access.")
-    st.stop()
-
-# Persist the validity timer for the same generated signal during reruns.
-signature = (signal["side"], signal["candle_time"].isoformat(), signal["price"])
-if st.session_state.get("signal_signature") != signature:
-    st.session_state["signal_signature"] = signature
-    st.session_state["signal_generated_at"] = datetime.now(timezone.utc)
-    st.session_state["signal_outcome"] = None
-    # Send each new signal once per Streamlit session. Both entry styles are notified.
-    if signal["side"] in ("BUY", "SELL"):
-        signal["valid_minutes"] = valid_minutes
-        market_entry = signal["price"]
-        market_sl = signal["sl"]
-        market_tps = signal["tps"]
-        ok, message = send_telegram(
-            telegram_signal_message(signal, "MARKET", market_entry, market_sl, market_tps,
-                                    "Market entry is near the latest closed 15M candle price.")
+    # BTC is scanned for diagnostics only. No BTC Telegram alert is ever sent.
+    try:
+        btc = scan_symbol(api_key, "BTC/USDT")
+        print(
+            f"BTC/USDT diagnostic: side={btc['side']} "
+            f"score={btc['score']} grade={btc.get('grade', '-')}"
         )
-        st.session_state["telegram_market_status"] = (ok, message)
+    except Exception as exc:
+        print(f"BTC/USDT diagnostic scan skipped: {exc}")
 
-        # A pullback limit is proposed at 15M EMA20 only when it is on the correct
-        # side of current price (below for BUY, above for SELL).
-        limit_entry = signal["ema20_15m"]
-        has_limit = (limit_entry < market_entry) if signal["side"] == "BUY" else (limit_entry > market_entry)
-        if has_limit:
-            risk_distance = abs(market_entry - market_sl)
-            limit_sl = limit_entry - risk_distance if signal["side"] == "BUY" else limit_entry + risk_distance
-            direction = 1 if signal["side"] == "BUY" else -1
-            limit_tps = [limit_entry + direction * risk_distance * rr for rr in (1.42, 2.24, 3.0)]
-            ok, message = send_telegram(
-                telegram_signal_message(signal, "LIMIT", limit_entry, limit_sl, limit_tps,
-                                        "Suggested pullback limit at 15M EMA20; order is not placed automatically.")
-            )
-            st.session_state["telegram_limit_status"] = (ok, message)
-        else:
-            st.session_state["telegram_limit_status"] = (False, "No valid pullback limit price on the correct side of market; no limit alert sent.")
-    else:
-        st.session_state["telegram_market_status"] = (False, "No new BUY/SELL signal; no Telegram alert sent.")
-        st.session_state["telegram_limit_status"] = (False, "No new BUY/SELL signal; no Telegram alert sent.")
+    if gold["side"] == "WAIT":
+        print("No qualifying XAU/USD signal. No Telegram message sent.")
+        return
 
-generated = st.session_state["signal_generated_at"]
-expires = generated + timedelta(minutes=valid_minutes)
-remaining = max(0, int((expires - datetime.now(timezone.utc)).total_seconds()))
-if remaining == 0 and signal["side"] != "WAIT":
-    signal["side"] = "WAIT"
-    signal["reason"] = "SIGNAL EXPIRED — WAIT FOR A NEW SETUP"
+    state = read_state()
+    candle_key = gold["candle_time"]
+    if state.get("last_gold_candle") == candle_key:
+        print("This XAU/USD candle was already notified. Duplicate blocked.")
+        return
 
-side = signal["side"]
-is_buy = side == "BUY"
-accent = "#22d879" if is_buy else "#ff596d" if side == "SELL" else "#d6a944"
-bg = "#041b0d" if is_buy else "#250911" if side == "SELL" else "#211b0b"
-symbol = "🟢" if is_buy else "🔴" if side == "SELL" else "🟡"
-rr_display = signal["rr"] if side != "WAIT" else "—"
-local_generated = generated.astimezone(ZoneInfo("Asia/Kabul")).strftime("%I:%M %p")
+    message = build_telegram_message(gold)
+    send_telegram(message)
+    state["last_gold_candle"] = candle_key
+    write_state(state)
+    print("XAU/USD Telegram alert sent and state saved.")
 
-# ----------------------- main signal card -------------------
 
-st.markdown(f"""
-<div style="border:3px solid {accent};border-radius:22px;overflow:hidden;
-background:#0b0713;box-shadow:0 0 18px {accent}55;margin:8px 0 18px 0">
-  <div style="background:{bg};padding:24px 16px;text-align:center;border-bottom:1px solid #30243b">
-    <div style="font-family:Georgia,serif;font-size:52px;font-weight:900;letter-spacing:5px;color:{accent}">{side}</div>
-    <div style="color:#a995c6;letter-spacing:3px;font-family:monospace;margin-top:3px">
-      XAUUSD&nbsp; · &nbsp;{signal['session']}&nbsp; · &nbsp;R:R {rr_display}
-    </div>
-    <div style="display:inline-block;margin-top:16px;padding:10px 20px;border:1px solid {accent}88;
-      border-radius:30px;background:#07150e;color:{accent};font-family:monospace;font-weight:bold">
-      {symbol} {signal['grade']} — SCORE: {signal['score']}/100 — {signal['risk_label']}
-    </div>
-    <div style="margin-top:14px;color:#bba7d7;font-family:monospace;letter-spacing:1px">
-      📊 TRENDING &nbsp; ⏱ {signal['reason']}
-    </div>
-    <div style="margin-top:18px;padding:17px 10px;border:1px solid #806b27;border-radius:15px;
-      background:#211b0b;color:#e2b84e;font-weight:bold;letter-spacing:2px;font-family:monospace">
-      ⏳ AI SAYS: {'WAIT THIS TRADE' if side == 'WAIT' else 'WAIT FOR ENTRY ZONE' if remaining < valid_minutes*60-60 else 'SETUP CONFIRMED — MANAGE WITH PLAN'}
-    </div>
-  </div>
-  <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;padding:18px 22px;background:#100b1b;border-bottom:1px solid #30243b">
-    <div><div style="font-size:28px;color:{accent};font-family:monospace">{remaining//60:02d}:{remaining%60:02d}</div>
-      <div class="small-muted">VALID FOR</div></div>
-    <div style="text-align:right"><div class="small-muted">GENERATED</div>
-      <div style="font-size:24px;color:#c6a9ec;font-family:monospace">{local_generated}</div>
-      <div class="small-muted">EXPIRES IN {valid_minutes} MIN</div></div>
-  </div>
-  <div style="padding:18px;text-align:center;background:#100b1b;border-bottom:1px solid #30243b">
-    <div class="small-muted">ENTRY ZONE</div>
-    <div style="font-size:23px;color:#c9b1ee;font-family:monospace;margin-top:8px">{fmt(signal['entry_low'])} — {fmt(signal['entry_high'])}</div>
-  </div>
-  <div style="padding:18px;text-align:center;background:#120914;border-bottom:1px solid #30243b">
-    <div class="small-muted">STOP LOSS</div>
-    <div style="font-size:24px;color:#ff6677;font-family:monospace;margin-top:8px">{fmt(signal['sl'])}</div>
-  </div>
-  <div style="padding:18px 14px;background:#0b0713">
-    <div class="small-muted" style="text-align:center;margin-bottom:15px">🎯 3-TARGET PROFIT SYSTEM</div>
-""", unsafe_allow_html=True)
-
-tp_alloc = [50, 30, 20]
-for i, (tp, alloc, rr) in enumerate(zip(signal["tps"], tp_alloc, [1.42, 2.24, 3.00]), start=1):
-    if side == "WAIT":
-        hit_label, tp_value = "HIT-RATE: NOT YET MEASURED", "—"
-    else:
-        tp_value = fmt(tp)
-        hit_label = "HISTORICAL HIT-RATE: NOT ENOUGH DATA"
-    st.markdown(f"""
-    <div style="background:#10101a;border:1px solid #26313b;border-left:4px solid #26d987;
-      border-radius:14px;padding:13px 15px;margin:10px 0">
-      <div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap">
-        <span style="color:#67e6a5;font-family:monospace;font-weight:bold">TP{i} &nbsp; <span style="border:1px solid #299c68;border-radius:20px;padding:3px 8px">{alloc}%</span></span>
-        <span style="color:#ad9acb;font-family:monospace">R:R 1:{rr:.2f}</span>
-        <span style="color:#65e6a4;font-family:monospace;font-size:19px">{tp_value}</span>
-      </div>
-      <div style="height:5px;background:#24172f;border-radius:8px;margin-top:13px"></div>
-      <div style="text-align:right;color:#8e83a4;font-size:10px;margin-top:5px">{hit_label}</div>
-    </div>
-    """, unsafe_allow_html=True)
-
-st.markdown(f"""
-  </div>
-  <div style="padding:17px;background:#100b1b;border-top:1px solid #30243b">
-    <div class="small-muted">INVALIDATION</div>
-    <div style="font-size:20px;color:#ff7787;font-family:monospace;margin-top:8px">{fmt(signal['invalidation'])}</div>
-  </div>
-</div>
-""", unsafe_allow_html=True)
-
-# Display both entry approaches. Limit is a conditional pullback idea, not an order execution.
-if side in ("BUY", "SELL"):
-    limit_entry_display = signal["ema20_15m"]
-    limit_valid_display = (limit_entry_display < signal["price"]) if side == "BUY" else (limit_entry_display > signal["price"])
-    st.markdown("### ENTRY TYPES")
-    e1, e2 = st.columns(2)
-    with e1:
-        st.metric("MARKET ENTRY", fmt(signal["price"]))
-        st.caption("Entry near the latest 15M candle close")
-    with e2:
-        st.metric("LIMIT ENTRY (15M EMA20)", fmt(limit_entry_display) if limit_valid_display else "NOT AVAILABLE")
-        st.caption("Pullback limit idea only; no broker order is placed")
-
-with st.expander("Telegram notification status"):
-    for key, title in (("telegram_market_status", "Market alert"), ("telegram_limit_status", "Limit alert")):
-        result = st.session_state.get(key)
-        if result:
-            st.write(f"{title}: {'SENT' if result[0] else 'NOT SENT'} — {result[1]}")
-    if not telegram_token or not telegram_chat_id:
-        st.warning("Add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in Streamlit Cloud → Settings → Secrets.")
-
-# Outcome buttons log only user-confirmed outcomes. No invented hit-rate.
-st.markdown("### TRADE RESULT")
-c1, c2 = st.columns(2)
-with c1:
-    if st.button("✓  MARK WIN", type="primary", disabled=side == "WAIT"):
-        st.session_state["trade_log"] = st.session_state.get("trade_log", []) + [{
-            "time": datetime.now(ZoneInfo("Asia/Kabul")).strftime("%Y-%m-%d %H:%M"),
-            "side": side, "result": "WIN", "score": signal["score"]
-        }]
-        st.session_state["signal_outcome"] = "WIN"
-with c2:
-    if st.button("✕  MARK LOSS", type="secondary", disabled=side == "WAIT"):
-        st.session_state["trade_log"] = st.session_state.get("trade_log", []) + [{
-            "time": datetime.now(ZoneInfo("Asia/Kabul")).strftime("%Y-%m-%d %H:%M"),
-            "side": side, "result": "LOSS", "score": signal["score"]
-        }]
-        st.session_state["signal_outcome"] = "LOSS"
-
-if st.session_state.get("signal_outcome"):
-    st.info(f"Current signal marked as {st.session_state['signal_outcome']}.")
-
-# ----------------------- analysis / audit --------------------
-
-st.markdown("### MARKET FILTERS")
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("XAU/USD", fmt(signal["price"]))
-m2.metric("15M ADX", f"{signal['adx']:.1f}")
-m3.metric("15M RSI", f"{signal['rsi']:.1f}")
-m4.metric("15M ATR", fmt(signal["atr"]))
-t1, t2 = st.columns(2)
-t1.metric("1H TREND", signal["trend_1h"])
-t2.metric("4H TREND", signal["trend_4h"])
-
-with st.expander("Show rule-by-rule signal checklist"):
-    if signal["checks"]:
-        for name, passed in signal["checks"].items():
-            st.write(("✅ " if passed else "❌ ") + name)
-    else:
-        st.write("No trade: at least one required trend-following condition is not satisfied.")
-    st.caption("The selected direction is scored from the trend filters. A signal is allowed only when the score is strictly above the selected minimum; 1H/4H trend alignment and the optional session filter remain important context.")
-
-with st.expander("Recent XAU/USD candles"):
-    st.line_chart(m15.tail(120)["close"], height=220)
-
-log = st.session_state.get("trade_log", [])
-st.markdown("### REAL USER-RECORDED RESULTS")
-if log:
-    wins = sum(x["result"] == "WIN" for x in log)
-    losses = sum(x["result"] == "LOSS" for x in log)
-    total = wins + losses
-    hit_rate = wins / total * 100 if total else 0
-    q1, q2, q3 = st.columns(3)
-    q1.metric("RECORDED TRADES", total)
-    q2.metric("WINS / LOSSES", f"{wins} / {losses}")
-    q3.metric("RECORDED WIN RATE", f"{hit_rate:.1f}%")
-    st.dataframe(pd.DataFrame(log), use_container_width=True, hide_index=True)
-else:
-    st.caption("No trade outcomes have been recorded yet. Hit-rate will appear only after you mark actual results.")
-
-st.caption("Educational decision-support tool. Backtest and forward-test before risking capital. Market data availability and API limits depend on your Twelve Data account.")
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print(f"SCANNER ERROR: {exc}", file=sys.stderr)
+        raise
